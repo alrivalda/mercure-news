@@ -3,34 +3,46 @@ import Hapi from "@hapi/hapi";
 import Parser from "@postlight/parser";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 30000);
+const STRICT_HTTP = String(process.env.STRICT_HTTP || "0") === "1";
+// STRICT_HTTP=1 => kalau fetch non-2xx, tetap return 502 (mode lama)
+// STRICT_HTTP=0 => return 200 dengan ok:false (recommended buat n8n batch)
+
+function now() {
+  return new Date().toISOString();
+}
+
+function pickHeaders(headers) {
+  // headers bisa beda implementasi, jadi aman-aman aja
+  const get = (k) => {
+    try {
+      return headers.get(k);
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    "content-type": get("content-type"),
+    server: get("server"),
+    "cf-ray": get("cf-ray"),
+    "cf-cache-status": get("cf-cache-status"),
+    location: get("location"),
+  };
+}
 
 const init = async () => {
   const server = Hapi.server({
     port: process.env.PORT || 3000,
     host: "0.0.0.0",
     routes: {
-      cors: {
-        origin: ["*"],
-        additionalHeaders: ["cache-control"],
-      },
-      timeout: {
-        server: false, // biar hapi gak motong request lama
-        socket: false,
-      },
+      cors: { origin: ["*"] },
+      timeout: { server: false, socket: false },
     },
   });
 
   server.route({
     method: "GET",
     path: "/health",
-    handler: (request, h) => {
-      return h
-        .response({
-          ok: true,
-          time: new Date().toISOString(),
-        })
-        .code(200);
-    },
+    handler: (request, h) => h.response({ ok: true, time: now() }).code(200),
   });
 
   server.route({
@@ -39,30 +51,28 @@ const init = async () => {
     handler: async (request, h) => {
       const url = request.query.url;
 
-      console.log(`[${new Date().toISOString()}] GET /parse`, {
+      console.log(`[${now()}] GET /parse`, {
         url,
         ip: request.info.remoteAddress,
-        userAgent: request.headers["user-agent"],
+        ua: request.headers["user-agent"],
       });
 
       if (!url) {
-        console.log(`[${new Date().toISOString()}] 400 missing url param`);
-        return h.response({ error: "Parameter ?url= wajib ada" }).code(400);
+        return h
+          .response({ ok: false, error: "Parameter ?url= wajib ada" })
+          .code(400);
       }
 
       const start = Date.now();
 
       try {
-        console.log(`[${new Date().toISOString()}] fetching start`, {
+        console.log(`[${now()}] fetching start`, {
           url,
           timeoutMs: DEFAULT_TIMEOUT_MS,
         });
 
         const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          DEFAULT_TIMEOUT_MS
-        );
+        const t = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
 
         const res = await fetch(url, {
           redirect: "follow",
@@ -76,74 +86,97 @@ const init = async () => {
           },
         });
 
-        clearTimeout(timeout);
+        clearTimeout(t);
 
-        console.log(`[${new Date().toISOString()}] fetching done`, {
+        const msFetch = Date.now() - start;
+
+        console.log(`[${now()}] fetching done`, {
           url,
           status: res.status,
           ok: res.ok,
+          ms: msFetch,
+          headers: pickHeaders(res.headers),
         });
 
+        // kalau non-2xx: ambil sedikit body biar keliatan blocked/rate-limited
         if (!res.ok) {
-          const ms = Date.now() - start;
-          console.log(`[${new Date().toISOString()}] fetch not ok`, {
+          let snippet = "";
+          try {
+            const text = await res.text();
+            snippet = (text || "").slice(0, 600);
+          } catch {}
+
+          const payload = {
+            ok: false,
             url,
-            ms,
-            status: res.status,
-          });
-          return h.response({ error: `Fetch failed: ${res.status}` }).code(502);
+            fetch: {
+              status: res.status,
+              statusText: res.statusText,
+              headers: pickHeaders(res.headers),
+              bodySnippet: snippet,
+            },
+            hint: "Target site returned non-2xx (often 403/429/451/503). Possible anti-bot, rate limit, geo-block, or datacenter IP block.",
+          };
+
+          if (STRICT_HTTP) return h.response(payload).code(502);
+          return h.response(payload).code(200);
         }
 
         const html = await res.text();
 
-        console.log(`[${new Date().toISOString()}] parsing start`, {
+        console.log(`[${now()}] parsing start`, {
           url,
           htmlLength: html.length,
         });
 
-        // Parser.parse(url, { html }) -> parse HTML yang sudah kita fetch
         const result = await Parser.parse(url, { html });
 
-        const ms = Date.now() - start;
-        console.log(`[${new Date().toISOString()}] parsing success`, {
+        const msTotal = Date.now() - start;
+
+        console.log(`[${now()}] parsing success`, {
           url,
-          ms,
+          ms: msTotal,
           title: result?.title,
           contentLength: result?.content?.length ?? 0,
         });
 
-        return h.response(result).code(200);
+        return h.response({ ok: true, url, result }).code(200);
       } catch (err) {
         const ms = Date.now() - start;
-        const name = err?.name;
-        const message = err?.message;
 
-        console.error(`[${new Date().toISOString()}] parsing error`, {
+        console.error(`[${now()}] parsing error`, {
           url,
           ms,
-          name,
-          message,
+          name: err?.name,
+          message: err?.message,
           stack: err?.stack,
         });
 
-        // AbortError biasanya timeout dari fetch AbortController
-        if (name === "AbortError") {
-          return h
-            .response({ error: "Timeout while fetching target URL" })
-            .code(504);
+        if (err?.name === "AbortError") {
+          const payload = {
+            ok: false,
+            url,
+            error: "Timeout while fetching target URL",
+          };
+          if (STRICT_HTTP) return h.response(payload).code(504);
+          return h.response(payload).code(200);
         }
 
-        return h.response({ error: message || "Internal error" }).code(500);
+        const payload = {
+          ok: false,
+          url,
+          error: err?.message || "Internal error",
+        };
+        if (STRICT_HTTP) return h.response(payload).code(500);
+        return h.response(payload).code(200);
       }
     },
   });
 
   await server.start();
+  console.log(`[${now()}] Server running on ${server.info.uri}`);
   console.log(
-    `[${new Date().toISOString()}] Server running on ${server.info.uri}`
-  );
-  console.log(
-    `[${new Date().toISOString()}] Config: FETCH_TIMEOUT_MS=${DEFAULT_TIMEOUT_MS}`
+    `[${now()}] Config: FETCH_TIMEOUT_MS=${DEFAULT_TIMEOUT_MS}, STRICT_HTTP=${STRICT_HTTP}`
   );
 };
 
